@@ -73,7 +73,6 @@ from crewai.events.listeners.tracing.utils import (
     should_enable_tracing,
     should_suppress_tracing_messages,
 )
-from crewai.events.types.llm_events import LLMCallCompletedEvent
 from crewai.events.types.flow_events import (
     FlowCreatedEvent,
     FlowFinishedEvent,
@@ -85,6 +84,7 @@ from crewai.events.types.flow_events import (
     MethodExecutionPausedEvent,
     MethodExecutionStartedEvent,
 )
+from crewai.events.types.llm_events import LLMCallCompletedEvent
 from crewai.flow.dsl._utils import build_flow_definition
 from crewai.flow.flow_context import (
     current_flow_defer_trace_finalization,
@@ -1437,10 +1437,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         owns_usage_aggregation = self._usage_aggregation_handler is None
         flow_id_token = None
         if owns_usage_aggregation:
-            if (
-                current_flow_id.get() is None
-                and self._flow_match_id is not None
-            ):
+            if current_flow_id.get() is None and self._flow_match_id is not None:
                 flow_id_token = current_flow_id.set(self._flow_match_id)
             self._attach_usage_aggregation_listener()
 
@@ -1462,9 +1459,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     try:
                         await asyncio.wrap_future(future)
                     except Exception:
-                        logger.warning(
-                            "FlowStartedEvent handler failed", exc_info=True
-                        )
+                        logger.warning("FlowStartedEvent handler failed", exc_info=True)
 
             get_env_context()
 
@@ -1599,9 +1594,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     return e
                 raise
 
-            final_result = (
-                self._method_outputs[-1] if self._method_outputs else result
-            )
+            final_result = self._method_outputs[-1] if self._method_outputs else result
 
             if self._event_futures:
                 await asyncio.gather(
