@@ -10,6 +10,8 @@ explicit contextvar control; no live LLM provider is required.
 from __future__ import annotations
 
 import contextvars
+import os
+import tempfile
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -17,8 +19,10 @@ import pytest
 
 from crewai.events.event_bus import crewai_event_bus
 from crewai.events.types.llm_events import LLMCallCompletedEvent, LLMCallType
-from crewai.flow.flow import Flow, start
+from crewai.flow.async_feedback.types import PendingFeedbackContext
+from crewai.flow.flow import Flow, listen, start
 from crewai.flow.flow_context import current_flow_id
+from crewai.flow.persistence.sqlite import SQLiteFlowPersistence
 from crewai.flow.runtime import _usage_dict_to_metrics
 from crewai.types.usage_metrics import UsageMetrics
 
@@ -250,3 +254,141 @@ class TestFlowUsageAggregation:
             failing.kickoff()
 
         assert handler_count() == before
+
+    def test_stale_handler_from_prior_kickoff_does_not_contaminate(self) -> None:
+        """The bus dispatches sync handlers on a thread pool that ``emit``
+        does not wait on. A handler still queued from a prior kickoff
+        must not write into a later kickoff's accumulator — the epoch
+        snapshot in the handler closure bails out on mismatch."""
+
+        captured: dict[str, Any] = {}
+
+        def script(flow: Flow) -> None:
+            _emit_llm_call(flow_id=flow._flow_match_id, prompt_tokens=10, completion_tokens=10)
+            captured["handler"] = flow._usage_aggregation_handler
+            captured["match_id"] = flow._flow_match_id
+
+        flow = _run(script)
+        first_total = flow.usage_metrics.total_tokens
+        assert first_total == 20
+
+        # A second kickoff bumps the epoch and resets the accumulator.
+        flow._script = lambda f: None
+        flow.kickoff()
+        assert flow.usage_metrics.total_tokens == 0
+
+        stale_handler = captured["handler"]
+        assert stale_handler is not None
+
+        stale_event = LLMCallCompletedEvent(
+            call_id=str(uuid4()),
+            model="gpt-4o-mini",
+            response="ok",
+            call_type=LLMCallType.LLM_CALL,
+            usage={"prompt_tokens": 999, "completion_tokens": 999, "total_tokens": 1998},
+        )
+        ctx = contextvars.copy_context()
+        ctx.run(lambda: (current_flow_id.set(captured["match_id"]), stale_handler(object(), stale_event)))
+
+        # Stale handler bailed: second kickoff's accumulator is still zero.
+        assert flow.usage_metrics.total_tokens == 0
+
+    def test_pause_detaches_listener_and_does_not_leak(self) -> None:
+        """When ``kickoff_async`` pauses for human feedback, the listener
+        must be detached from the singleton bus to avoid leaking handlers
+        across abandoned paused instances. Pre-pause LLM events still
+        count because the bus snapshots handlers at emit time. Late
+        events emitted after the pause returns do not count for this
+        instance — resume paths re-attach a fresh listener."""
+
+        from crewai.flow.async_feedback.types import HumanFeedbackPending
+
+        captured: dict[str, Any] = {}
+
+        class _PausingFlow(Flow):
+            @start()
+            def begin(self) -> None:
+                _emit_llm_call(
+                    flow_id=self._flow_match_id,
+                    prompt_tokens=10,
+                    completion_tokens=20,
+                )
+                captured["pre_pause_total"] = self.usage_metrics.total_tokens
+                raise HumanFeedbackPending(
+                    context=PendingFeedbackContext(
+                        flow_id=self.flow_id,
+                        flow_class="_PausingFlow",
+                        method_name="begin",
+                        method_output="content",
+                        message="Review:",
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "f.db"))
+            flow = _PausingFlow(persistence=persistence)
+            result = flow.kickoff()
+
+            assert isinstance(result, HumanFeedbackPending)
+            assert captured["pre_pause_total"] == 30
+            assert flow._usage_aggregation_handler is None
+
+            # A late event emitted after the pause does not reach the
+            # detached listener, so the running total is unchanged.
+            _emit_llm_call(
+                flow_id=flow._flow_match_id,
+                prompt_tokens=2,
+                completion_tokens=3,
+            )
+            assert flow.usage_metrics.total_tokens == 30
+
+    def test_aggregates_resume_after_from_pending(self) -> None:
+        """A flow restored via ``from_pending`` is a fresh instance with no
+        ``_flow_match_id``; without seeding it, the listener attached in
+        ``resume_async`` either ignores its own LLM calls or absorbs unrelated
+        ones. ``from_pending`` must seed the match id so the resume-phase
+        aggregator counts our own calls and only our own calls."""
+
+        class _ResumeFlow(Flow):
+            @start()
+            def begin(self) -> str:
+                return "content"
+
+            @listen(begin)
+            def on_begin(self, _feedback: Any) -> str:
+                _emit_llm_call(
+                    flow_id=self._flow_match_id,
+                    prompt_tokens=100,
+                    completion_tokens=50,
+                )
+                _emit_llm_call(
+                    flow_id="some-other-flow",
+                    prompt_tokens=9_999,
+                    completion_tokens=9_999,
+                )
+                return "done"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "f.db"))
+            flow_id = "usage-resume-test"
+            persistence.save_pending_feedback(
+                flow_uuid=flow_id,
+                context=PendingFeedbackContext(
+                    flow_id=flow_id,
+                    flow_class="_ResumeFlow",
+                    method_name="begin",
+                    method_output="content",
+                    message="Review:",
+                ),
+                state_data={"id": flow_id},
+            )
+
+            flow = _ResumeFlow.from_pending(flow_id, persistence)
+            assert flow._flow_match_id == flow.flow_id
+
+            flow.resume("ok")
+
+            assert flow.usage_metrics.total_tokens == 150
+            assert flow.usage_metrics.prompt_tokens == 100
+            assert flow.usage_metrics.completion_tokens == 50
+            assert flow.usage_metrics.successful_requests == 1
