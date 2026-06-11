@@ -205,7 +205,10 @@ class TestFlowUsageAggregation:
         assert flow.usage_metrics.total_tokens == 500
         assert flow.usage_metrics.successful_requests == 1
 
-    def test_snapshot_is_immutable(self) -> None:
+    def test_usage_metrics_returns_independent_copy(self) -> None:
+        """``usage_metrics`` must return a copy, not the internal instance —
+        otherwise callers can clobber the in-flight accumulator."""
+
         flow = _run(
             lambda f: _emit_llm_call(
                 flow_id=f._flow_match_id, prompt_tokens=50, completion_tokens=50
@@ -219,7 +222,7 @@ class TestFlowUsageAggregation:
 
     def test_handler_is_unregistered_after_kickoff(self) -> None:
         """Long-lived workers (Celery, devkit) must not leak one handler per
-        kickoff on the singleton bus."""
+        kickoff on the singleton bus, on either the success or failure path."""
 
         def handler_count() -> int:
             return len(
@@ -234,5 +237,16 @@ class TestFlowUsageAggregation:
         )
         for _ in range(3):
             flow.kickoff()
+
+        assert handler_count() == before
+
+        def boom(_f: Flow) -> None:
+            raise RuntimeError("boom")
+
+        failing = _ScriptedFlow()
+        failing._script = boom
+
+        with pytest.raises(RuntimeError, match="boom"):
+            failing.kickoff()
 
         assert handler_count() == before
