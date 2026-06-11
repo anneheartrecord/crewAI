@@ -73,6 +73,7 @@ from crewai.events.listeners.tracing.utils import (
     should_enable_tracing,
     should_suppress_tracing_messages,
 )
+from crewai.events.types.llm_events import LLMCallCompletedEvent
 from crewai.events.types.flow_events import (
     FlowCreatedEvent,
     FlowFinishedEvent,
@@ -129,6 +130,7 @@ if TYPE_CHECKING:
 
 from crewai.flow.visualization import build_flow_structure, render_interactive
 from crewai.types.streaming import CrewStreamingOutput, FlowStreamingOutput
+from crewai.types.usage_metrics import UsageMetrics
 from crewai.utilities.env import get_env_context
 from crewai.utilities.streaming import (
     TaskInfo,
@@ -151,6 +153,32 @@ ExecutionContext = Any  # type: ignore[assignment,misc]
 
 
 logger = logging.getLogger(__name__)
+
+
+def _usage_dict_to_metrics(usage: dict[str, Any] | None) -> UsageMetrics | None:
+    if not usage:
+        return None
+
+    def _int(key: str) -> int:
+        value = usage.get(key)
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    prompt_tokens = _int("prompt_tokens")
+    completion_tokens = _int("completion_tokens")
+    total_tokens = _int("total_tokens") or (prompt_tokens + completion_tokens)
+
+    return UsageMetrics(
+        total_tokens=total_tokens,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_prompt_tokens=_int("cached_prompt_tokens"),
+        reasoning_tokens=_int("reasoning_tokens"),
+        cache_creation_tokens=_int("cache_creation_tokens"),
+        successful_requests=1,
+    )
 
 
 def _condition_branches(
@@ -905,6 +933,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
     _input_history: list[InputHistoryEntry] = PrivateAttr(default_factory=list)
     _state: Any = PrivateAttr(default=None)
     _deferred_flow_started_event_id: str | None = PrivateAttr(default=None)
+    _aggregated_usage_metrics: UsageMetrics = PrivateAttr(default_factory=UsageMetrics)
+    _flow_match_id: str | None = PrivateAttr(default=None)
+    _usage_aggregation_handler: Callable[..., Any] | None = PrivateAttr(default=None)
 
     def __class_getitem__(cls: type[Flow[T]], item: type[T]) -> type[Flow[T]]:  # type: ignore[override]
         class _FlowGeneric(cls):  # type: ignore[valid-type,misc]
@@ -966,6 +997,36 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             if not hasattr(method, "__self__"):
                 method = method.__get__(self, self.__class__)
             self._methods[FlowMethodName(method_name)] = method
+
+    def _attach_usage_aggregation_listener(self) -> None:
+        """Wire an ``LLMCallCompletedEvent`` listener for the duration of one
+        ``kickoff_async`` call.
+        """
+        if self._usage_aggregation_handler is not None:
+            return
+
+        flow_ref = self
+
+        def _accumulate(source: Any, event: LLMCallCompletedEvent) -> None:
+            if current_flow_id.get() != flow_ref._flow_match_id:
+                return
+            metrics = _usage_dict_to_metrics(event.usage)
+            if metrics is not None:
+                flow_ref._aggregated_usage_metrics.add_usage_metrics(metrics)
+
+        crewai_event_bus.on(LLMCallCompletedEvent)(_accumulate)
+        self._usage_aggregation_handler = _accumulate
+
+    def _detach_usage_aggregation_listener(self) -> None:
+        handler = self._usage_aggregation_handler
+        if handler is None:
+            return
+        crewai_event_bus.off(LLMCallCompletedEvent, handler)
+        self._usage_aggregation_handler = None
+
+    @property
+    def usage_metrics(self) -> UsageMetrics:
+        return self._aggregated_usage_metrics.model_copy()
 
     def recall(self, query: str, **kwargs: Any) -> Any:
         """Recall relevant memories. Delegates to this flow's memory.
@@ -2056,6 +2117,14 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             request_id_token = current_flow_request_id.set(self.flow_id)
 
         runtime_scope = crewai_event_bus._enter_runtime_scope()
+
+        # Capture the flow id seen by `FlowTrackable._set_flow_context` so we
+        # can match LLM call events back to this flow even if `state.id` gets
+        # overwritten later by `inputs["id"]`.
+        self._flow_match_id = current_flow_id.get()
+        self._aggregated_usage_metrics = UsageMetrics()
+        self._attach_usage_aggregation_listener()
+
         try:
             # Reset flow state for fresh execution unless restoring from persistence
             is_restoring = (
@@ -2345,6 +2414,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             # Ensure all background memory saves complete before returning
             if self.memory is not None and hasattr(self.memory, "drain_writes"):
                 self.memory.drain_writes()
+            self._detach_usage_aggregation_listener()
             if request_id_token is not None:
                 current_flow_request_id.reset(request_id_token)
             if flow_defer_trace_finalization_token is not None:
